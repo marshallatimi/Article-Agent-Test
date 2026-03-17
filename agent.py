@@ -36,6 +36,7 @@ ANALYTICS_SITE_ID = os.environ.get("ANALYTICS_SITE_ID", "")
 ANALYTICS_API_KEY = os.environ.get("ANALYTICS_API_KEY", "")
 ADSENSE_CODE      = os.environ.get("ADSENSE_CODE", "")
 AFFILIATE_TAG     = os.environ.get("AFFILIATE_TAG", "")
+ARTICLES_PER_RUN  = int(os.environ.get("ARTICLES_PER_RUN", "3"))  # default: 3 per day
 
 STATE_FILE  = "state.json"
 MODEL       = "claude-sonnet-4-20250514"
@@ -208,7 +209,7 @@ def tool_publish_article(title: str, html: str, tags: list = None, excerpt: str 
 
 
 def _publish_ghost(title, slug, html, tags, excerpt) -> str:
-    """Ghost Admin API v3."""
+    """Ghost Admin API — uses mobiledoc HTML card so body content always renders."""
     import jwt as pyjwt  # pip install PyJWT
     key_id, secret = CMS_API_KEY.split(":")
     iat = int(time.time())
@@ -216,12 +217,21 @@ def _publish_ghost(title, slug, html, tags, excerpt) -> str:
     payload = {"iat": iat, "exp": iat + 300, "aud": "/admin/"}
     token = pyjwt.encode(payload, bytes.fromhex(secret), algorithm="HS256", headers=header)
 
+    # Ghost ignores raw `html` field in many versions — wrap in mobiledoc HTML card instead
+    mobiledoc = json.dumps({
+        "version": "0.3.1",
+        "markups": [],
+        "atoms":   [],
+        "cards":   [["html", {"html": html}]],
+        "sections": [[10, 0]],
+    })
+
     url  = f"{CMS_URL.rstrip('/')}/ghost/api/admin/posts/"
     body = {
         "posts": [{
             "title":        title,
             "slug":         slug,
-            "html":         html,
+            "mobiledoc":    mobiledoc,
             "status":       "published",
             "excerpt":      excerpt,
             "tags":         [{"name": t} for t in tags],
@@ -233,6 +243,7 @@ def _publish_ghost(title, slug, html, tags, excerpt) -> str:
         post_url = r.json()["posts"][0].get("url", "")
         print(f"[publish_ghost] published: {post_url}")
         return f"Published: {post_url}"
+    print(f"[publish_ghost] error {r.status_code}: {r.text[:400]}")
     return f"Ghost error {r.status_code}: {r.text[:200]}"
 
 
@@ -322,6 +333,7 @@ def build_system_prompt(state: dict) -> str:
         f"Topic queue ({len(state['topic_queue'])} remaining): {state['topic_queue'][:5]}"
         if state["topic_queue"] else "Topic queue is empty."
     )
+    articles_per_run = ARTICLES_PER_RUN
     return f"""You are an autonomous business agent managing a content website to generate passive income through ads and affiliate links.
 
 Current state:
@@ -331,33 +343,37 @@ Current state:
 - {queue_ctx}
 - Site URL: {state.get('site_url') or 'not set'}
 
-Your job today (pick the most important task):
+Your job today:
 1. RESEARCH phase: If no niche is chosen, search for a profitable low-competition niche and call save_niche with the niche + 20 topic ideas.
-2. BUILD phase: If niche is set but fewer than 30 articles are published, write and publish one high-quality SEO article from the topic queue.
-3. GROW phase: If 30+ articles exist, fetch analytics, identify top performers, and either update an existing article or write a new one on a related keyword.
+2. BUILD phase: Write and publish {articles_per_run} articles in a row — one after another. For each: call write_article, then immediately call publish_article with the result. Then start the next article.
+3. GROW phase: Fetch analytics first, then write and publish {articles_per_run} articles targeting keywords related to your top-performing pages.
 
 Rules:
 - Always use tools — don't just describe what you would do, do it.
-- For articles: write_article first, then immediately publish_article with the result.
-- Pick topics from the queue when available. If the queue runs low (< 5), generate more.
+- Write all {articles_per_run} articles before stopping. Do not stop after just one.
+- For each article: write_article → publish_article → move to next topic.
+- Pick topics from the queue. If the queue runs low (< {articles_per_run}), mentally generate extras from the niche.
+- Vary article formats: how-to guides, listicles, comparison posts, beginner guides — keep the site diverse.
 - Keep articles practical, helpful, and genuinely useful to readers.
 - Today's date: {datetime.now().strftime('%B %d, %Y')}"""
 
 
 def run_agent(state: dict):
-    """Run one agent session — Claude decides what to do and executes tools."""
+    """Run one agent session — Claude writes ARTICLES_PER_RUN articles."""
+    target = ARTICLES_PER_RUN
     print(f"\n{'='*60}")
-    print(f"Agent run — phase={state['phase']}, articles={state['total_articles']}")
+    print(f"Agent run — phase={state['phase']}, articles={state['total_articles']}, target today={target}")
     print(f"{'='*60}")
 
     messages = [
         {
             "role": "user",
-            "content": "Run your daily task. Use tools to take real action — research, write, or publish as needed.",
+            "content": f"Run your daily task. Write and publish {target} articles today. Use tools to take real action.",
         }
     ]
 
-    max_iterations = 10
+    # Each article takes ~3 tool calls (write + publish + maybe search), plus overhead
+    max_iterations = target * 4 + 6
     for iteration in range(max_iterations):
         response = client.messages.create(
             model=MODEL,
@@ -401,6 +417,13 @@ def run_agent(state: dict):
         if state["total_articles"] >= 30 and state["phase"] == "build":
             state["phase"] = "grow"
             print("[agent] Transitioning to GROW phase.")
+
+        # Stop early if we've hit today's target
+        articles_this_run = state["total_articles"] - (state["total_articles"] - len([
+            b for b in response.content if getattr(b, "type", None) == "tool_use" and getattr(b, "name", None) == "publish_article"
+        ]))
+        if state["total_articles"] > 0 and response.stop_reason == "end_turn":
+            break
 
     print(f"\n[agent] Session complete. Articles total: {state['total_articles']}")
 
